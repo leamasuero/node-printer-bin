@@ -1,0 +1,6 @@
+{
+  "name": "node-printer-bin",
+  "description": "pre-compiled for node-printer",
+  "private": false,
+  "version": "0.1.0"
+}
