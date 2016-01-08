@@ -4,8 +4,10 @@
 #include <map>
 #include <utility>
 #include <sstream>
+#include <node_version.h>
 
 #include <cups/cups.h>
+#include <cups/ppd.h>
 
 namespace
 {
@@ -119,6 +121,74 @@ namespace
         return "";
     }
 
+    /** Parses printer driver PPD options
+     */
+    void populatePpdOptions(v8::Handle<v8::Object> ppd_options, ppd_file_t  *ppd, ppd_group_t *group)
+    {
+        int i, j;
+        ppd_option_t *option;
+        ppd_choice_t *choice;
+        ppd_group_t *subgroup;
+
+        for (i = group->num_options, option = group->options; i > 0; --i, ++option)
+        {
+            MY_NODE_MODULE_ISOLATE_DECL
+            v8::Local<v8::Object> ppd_suboptions = V8_VALUE_NEW_DEFAULT_V_0_11_10(Object);
+            for (j = option->num_choices, choice = option->choices;
+                 j > 0;
+                 --j, ++choice)
+            {
+                ppd_suboptions->Set(V8_STRING_NEW_UTF8(choice->choice), V8_VALUE_NEW_V_0_11_10(Boolean, static_cast<bool>(choice->marked)));
+            }
+
+            ppd_options->Set(V8_STRING_NEW_UTF8(option->keyword), ppd_suboptions);
+        }
+
+        for (i = group->num_subgroups, subgroup = group->subgroups; i > 0; --i, ++subgroup) {
+            populatePpdOptions(ppd_options, ppd, subgroup);
+        }
+    }
+
+    /** Parse printer driver options
+     * @return error string.
+     */
+    std::string parseDriverOptions(const cups_dest_t * printer, v8::Handle<v8::Object> ppd_options)
+    {
+        const char *filename;
+        ppd_file_t *ppd;
+        ppd_group_t *group;
+        int i;
+
+        std::ostringstream error_str; // error string
+
+        if ((filename = cupsGetPPD(printer->name)) != NULL)
+        {
+            if ((ppd = ppdOpenFile(filename)) != NULL)
+            {
+                 ppdMarkDefaults(ppd);
+                 cupsMarkOptions(ppd, printer->num_options, printer->options);
+
+                 for (i = ppd->num_groups, group = ppd->groups; i > 0; --i, ++group)
+                 {
+                    populatePpdOptions(ppd_options, ppd, group);
+                 }
+                 ppdClose(ppd);
+            }
+            else
+            {
+                error_str << "Unable to open PPD filename " << filename << " ";
+            }
+            unlink(filename);
+        }
+        else
+        {
+            error_str << "Unable to get CUPS PPD driver file. ";
+        }
+
+        return error_str.str();
+    }
+
+
     /** Parse printer info object
      * @return error string.
      */
@@ -132,8 +202,9 @@ namespace
         {
             result_printer->Set(V8_STRING_NEW_UTF8("instance"), V8_STRING_NEW_UTF8(printer->instance));
         }
+
         v8::Local<v8::Object> result_printer_options = V8_VALUE_NEW_DEFAULT_V_0_11_10(Object);
-        cups_option_t *dest_option = printer->options; 
+        cups_option_t *dest_option = printer->options;
         for(int j = 0; j < printer->num_options; ++j, ++dest_option)
         {
             result_printer_options->Set(V8_STRING_NEW_UTF8(dest_option->name), V8_STRING_NEW_UTF8(dest_option->value));
@@ -164,6 +235,37 @@ namespace
         cupsFreeJobs(totalJobs, jobs);
         return error_str;
     }
+
+    /// cups option class to automatically free memory.
+    class CupsOptions: public MemValueBase<cups_option_t> {
+    protected:
+        int num_options;
+        virtual void free() {
+            if(_value != NULL)
+            {
+                cupsFreeOptions(num_options, get());
+                _value = NULL;
+                num_options = 0;
+            }
+        }
+    public:
+        CupsOptions(): num_options(0) {}
+
+        /// Add options from v8 object
+        CupsOptions(v8::Local<v8::Object> iV8Options): num_options(0) {
+            v8::Local<v8::Array> props = iV8Options->GetPropertyNames();
+
+            for(unsigned int i = 0; i < props->Length(); ++i) {
+                v8::Handle<v8::Value> key(props->Get(i));
+                v8::String::Utf8Value keyStr(key->ToString());
+                v8::String::Utf8Value valStr(iV8Options->Get(key)->ToString());
+
+                num_options = cupsAddOption(*keyStr, *valStr, num_options, &_value);
+            }
+        }
+
+        const int& getNumOptions() { return num_options; }
+    };
 }
 
 MY_NODE_MODULE_CALLBACK(getPrinters)
@@ -198,7 +300,17 @@ MY_NODE_MODULE_CALLBACK(getPrinters)
 MY_NODE_MODULE_CALLBACK(getDefaultPrinterName)
 {
     MY_NODE_MODULE_HANDLESCOPE;
-    MY_NODE_MODULE_RETURN_VALUE(V8_STRING_NEW_UTF8(cupsGetDefault2(CUPS_HTTP_DEFAULT)));
+    //This does not return default user printer name according to https://www.cups.org/documentation.php/doc-2.0/api-cups.html#cupsGetDefault2
+    //so leave as undefined and JS implementation will loop in all printers
+    /*
+    const char * printerName = cupsGetDefault();
+
+    // return default printer name only if defined
+    if(printerName != NULL) {
+        MY_NODE_MODULE_RETURN_VALUE(V8_STRING_NEW_UTF8(printerName));
+    }
+    */
+    MY_NODE_MODULE_RETURN_UNDEFINED();
 }
 
 MY_NODE_MODULE_CALLBACK(getPrinter)
@@ -222,6 +334,29 @@ MY_NODE_MODULE_CALLBACK(getPrinter)
         RETURN_EXCEPTION_STR("Printer not found");
     }
     MY_NODE_MODULE_RETURN_VALUE(result_printer);
+}
+
+MY_NODE_MODULE_CALLBACK(getPrinterDriverOptions)
+{
+    MY_NODE_MODULE_HANDLESCOPE;
+    REQUIRE_ARGUMENTS(iArgs, 1);
+    REQUIRE_ARGUMENT_STRING(iArgs, 0, printername);
+
+    cups_dest_t *printers = NULL, *printer = NULL;
+    int printers_size = cupsGetDests(&printers);
+    printer = cupsGetDest(*printername, NULL, printers_size, printers);
+    v8::Local<v8::Object> driver_options = V8_VALUE_NEW_DEFAULT_V_0_11_10(Object);
+    if(printer != NULL)
+    {
+        parseDriverOptions(printer, driver_options);
+    }
+    cupsFreeDests(printers_size, printers);
+    if(printer == NULL)
+    {
+        // printer not found
+        RETURN_EXCEPTION_STR("Printer not found");
+    }
+    MY_NODE_MODULE_RETURN_VALUE(driver_options);
 }
 
 MY_NODE_MODULE_CALLBACK(getJob)
@@ -308,7 +443,7 @@ MY_NODE_MODULE_CALLBACK(getSupportedPrintFormats)
 MY_NODE_MODULE_CALLBACK(PrintDirect)
 {
     MY_NODE_MODULE_HANDLESCOPE;
-    REQUIRE_ARGUMENTS(iArgs, 4);
+    REQUIRE_ARGUMENTS(iArgs, 5);
 
     // can be string or buffer
     if(iArgs.Length() <= 0)
@@ -318,18 +453,7 @@ MY_NODE_MODULE_CALLBACK(PrintDirect)
 
     std::string data;
     v8::Handle<v8::Value> arg0(iArgs[0]);
-
-    if(arg0->IsString())
-    {
-        v8::String::Utf8Value data_str_v8(arg0->ToString());
-        data.assign(*data_str_v8, data_str_v8.length());
-    }
-    else if(arg0->IsObject() && arg0.As<v8::Object>()->HasIndexedPropertiesInExternalArrayData())
-    {
-        data.assign(static_cast<char*>(arg0.As<v8::Object>()->GetIndexedPropertiesExternalArrayData()),
-                    arg0.As<v8::Object>()->GetIndexedPropertiesExternalArrayDataLength());
-    }
-    else
+    if (!getStringOrBufferFromV8Value(arg0, data))
     {
         RETURN_EXCEPTION_STR("Argument 0 must be a string or Buffer");
     }
@@ -337,6 +461,8 @@ MY_NODE_MODULE_CALLBACK(PrintDirect)
     REQUIRE_ARGUMENT_STRING(iArgs, 1, printername);
     REQUIRE_ARGUMENT_STRING(iArgs, 2, docname);
     REQUIRE_ARGUMENT_STRING(iArgs, 3, type);
+    REQUIRE_ARGUMENT_OBJECT(iArgs, 4, print_options);
+
     std::string type_str(*type);
     FormatMapType::const_iterator itFormat = getPrinterFormatMap().find(type_str);
     if(itFormat == getPrinterFormatMap().end())
@@ -344,9 +470,10 @@ MY_NODE_MODULE_CALLBACK(PrintDirect)
         RETURN_EXCEPTION_STR("unsupported format type");
     }
     type_str = itFormat->second;
-    int num_options = 0;
-    cups_option_t *options = NULL;
-    int job_id = cupsCreateJob(CUPS_HTTP_DEFAULT, *printername, *docname, num_options, options);
+
+    CupsOptions options(print_options);
+
+    int job_id = cupsCreateJob(CUPS_HTTP_DEFAULT, *printername, *docname, options.getNumOptions(), options.get());
     if(job_id == 0) {
         RETURN_EXCEPTION_STR(cupsLastErrorString());
     }
@@ -361,8 +488,35 @@ MY_NODE_MODULE_CALLBACK(PrintDirect)
         cupsFinishDocument(CUPS_HTTP_DEFAULT, *printername);
         RETURN_EXCEPTION_STR(cupsLastErrorString());
     }
-    
+
     cupsFinishDocument(CUPS_HTTP_DEFAULT, *printername);
 
     MY_NODE_MODULE_RETURN_VALUE(V8_VALUE_NEW(Number, job_id));
+}
+
+MY_NODE_MODULE_CALLBACK(PrintFile)
+{
+    MY_NODE_MODULE_HANDLESCOPE;
+    REQUIRE_ARGUMENTS(iArgs, 3);
+
+    // can be string or buffer
+    if(iArgs.Length() <= 0)
+    {
+        RETURN_EXCEPTION_STR("Argument 0 missing");
+    }
+
+    REQUIRE_ARGUMENT_STRING(iArgs, 0, filename);
+    REQUIRE_ARGUMENT_STRING(iArgs, 1, docname);
+    REQUIRE_ARGUMENT_STRING(iArgs, 2, printer);
+    REQUIRE_ARGUMENT_OBJECT(iArgs, 3, print_options);
+
+    CupsOptions options(print_options);
+
+    int job_id = cupsPrintFile(*printer, *filename, *docname, options.getNumOptions(), options.get());
+
+    if(job_id == 0){
+        MY_NODE_MODULE_RETURN_VALUE(V8_STRING_NEW_UTF8(cupsLastErrorString()));
+    } else {
+        MY_NODE_MODULE_RETURN_VALUE(V8_VALUE_NEW(Number, job_id));
+    }
 }

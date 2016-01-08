@@ -3,6 +3,7 @@
 #if _MSC_VER
 #include <windows.h>
 #include <Winspool.h>
+#include <Wingdi.h>
 #pragma  comment(lib, "Winspool.lib")
 #else
 #error "Unsupported compiler for windows. Feel free to add it."
@@ -12,6 +13,7 @@
 #include <map>
 #include <utility>
 #include <sstream>
+#include <node_version.h>
 
 namespace{
     typedef std::map<std::string, DWORD> StatusMapType;
@@ -19,28 +21,22 @@ namespace{
     /** Memory value class management to avoid memory leak
     */
     template<typename Type>
-    struct MemValue
-    {
+    class MemValue: public MemValueBase<Type> {
+    public:
         /** Constructor of allocating iSizeKbytes bytes memory;
         * @param iSizeKbytes size in bytes of required allocating memory
         */
-        MemValue(const DWORD iSizeKbytes): _value(NULL)
-        {
+        MemValue(const DWORD iSizeKbytes) {
             _value = (Type*)malloc(iSizeKbytes);
         }
-        /** Destructor. The allocated memory will be deallocated
-        */
-        ~MemValue()
-        {
+    protected:
+        virtual void free() {
             if(_value != NULL)
             {
-                free(_value);
+                ::free(_value);
+                _value = NULL;
             }
         }
-        Type * get() {return _value; }
-        Type * operator ->() { return &_value; }
-        operator bool() const { return (_value != NULL); }
-        Type *_value;
     };
 
     struct PrinterHandle
@@ -159,6 +155,7 @@ namespace{
         ATTRIBUTE_PRINTER_ADD("QUEUED", PRINTER_ATTRIBUTE_QUEUED);
         ATTRIBUTE_PRINTER_ADD("RAW-ONLY", PRINTER_ATTRIBUTE_RAW_ONLY);
         ATTRIBUTE_PRINTER_ADD("SHARED", PRINTER_ATTRIBUTE_SHARED);
+        ATTRIBUTE_PRINTER_ADD("OFFLINE", PRINTER_ATTRIBUTE_WORK_OFFLINE);
         // XP
 #ifdef PRINTER_ATTRIBUTE_FAX
         ATTRIBUTE_PRINTER_ADD("FAX", PRINTER_ATTRIBUTE_FAX);
@@ -476,15 +473,16 @@ MY_NODE_MODULE_CALLBACK(getPrinters)
 MY_NODE_MODULE_CALLBACK(getDefaultPrinterName)
 {
     MY_NODE_MODULE_HANDLESCOPE;
-    DWORD bSize = 0;
-    GetDefaultPrinterW(NULL, &bSize);
+    // size in chars of the printer name: https://msdn.microsoft.com/en-us/library/windows/desktop/dd144876(v=vs.85).aspx
+    DWORD cSize = 0;
+    GetDefaultPrinterW(NULL, &cSize);
 
-    if(bSize == 0) {
+    if(cSize == 0) {
         MY_NODE_MODULE_RETURN_VALUE(V8_STRING_NEW_UTF8(""));
     }
 
-    MemValue<uint16_t> bPrinterName(bSize);
-    BOOL res = GetDefaultPrinterW((LPWSTR)(bPrinterName.get()), &bSize);
+    MemValue<uint16_t> bPrinterName(cSize*sizeof(uint16_t));
+    BOOL res = GetDefaultPrinterW((LPWSTR)(bPrinterName.get()), &cSize);
 
     if(!res) {
         MY_NODE_MODULE_RETURN_VALUE(V8_STRING_NEW_UTF8(""));
@@ -529,6 +527,12 @@ MY_NODE_MODULE_CALLBACK(getPrinter)
     }
 
     MY_NODE_MODULE_RETURN_VALUE(result_printer);
+}
+
+MY_NODE_MODULE_CALLBACK(getPrinterDriverOptions)
+{
+    MY_NODE_MODULE_HANDLESCOPE;
+    RETURN_EXCEPTION_STR("not supported on windows");
 }
 
 MY_NODE_MODULE_CALLBACK(getJob)
@@ -591,7 +595,7 @@ MY_NODE_MODULE_CALLBACK(setJob)
     if(!printerHandle)
     {
         std::string error_str("error on PrinterHandle: ");
-	error_str += getLastErrorCodeAndMessage();
+        error_str += getLastErrorCodeAndMessage();
         RETURN_EXCEPTION_STR(error_str.c_str());
     }
     // TODO: add the possibility to set job properties
@@ -616,9 +620,45 @@ MY_NODE_MODULE_CALLBACK(getSupportedPrintFormats)
 {
     MY_NODE_MODULE_HANDLESCOPE;
     v8::Local<v8::Array> result = V8_VALUE_NEW_DEFAULT_V_0_11_10(Array);
-    int i = 0;
-    result->Set(i++, V8_STRING_NEW_UTF8("RAW"));
-    result->Set(i++, V8_STRING_NEW_UTF8("TEXT"));
+    int format_i = 0;
+
+    LPTSTR name = NULL;
+    DWORD numBytes = 0, processorsNum = 0;
+
+    // Check the amount of bytes required
+    LPWSTR nullVal = NULL;
+    EnumPrintProcessorsW(nullVal, nullVal, 1, (LPBYTE)(NULL), numBytes, &numBytes, &processorsNum);
+    MemValue<_PRINTPROCESSOR_INFO_1W> processors(numBytes);
+    // Retrieve processors
+    BOOL isOK = EnumPrintProcessorsW(nullVal, nullVal, 1, (LPBYTE)(processors.get()), numBytes, &numBytes, &processorsNum);
+
+    if(!isOK) {
+        std::string error_str("error on EnumPrintProcessorsW: ");
+        error_str += getLastErrorCodeAndMessage();
+        RETURN_EXCEPTION_STR(error_str.c_str());
+    }
+
+    _PRINTPROCESSOR_INFO_1W *pProcessor = processors.get();
+
+    for(DWORD processor_i = 0; processor_i < processorsNum; ++processor_i, ++pProcessor) {
+        numBytes = 0;
+        DWORD dataTypesNum = 0;
+        EnumPrintProcessorDatatypesW(nullVal, pProcessor->pName, 1, (LPBYTE)(NULL), numBytes, &numBytes, &dataTypesNum);
+        MemValue<_DATATYPES_INFO_1W> dataTypes(numBytes);
+        isOK = EnumPrintProcessorDatatypesW(nullVal, pProcessor->pName, 1, (LPBYTE)(dataTypes.get()), numBytes, &numBytes, &dataTypesNum);
+
+        if(!isOK) {
+            std::string error_str("error on EnumPrintProcessorDatatypesW: ");
+            error_str += getLastErrorCodeAndMessage();
+            RETURN_EXCEPTION_STR(error_str.c_str());
+        }
+
+        _DATATYPES_INFO_1W *pDataType = dataTypes.get();
+        for(DWORD j = 0; j < dataTypesNum; ++j, ++pDataType) {
+            result->Set(format_i++, V8_STRING_NEW_2BYTES((uint16_t*)(pDataType->pName)));
+        }
+    }
+
     MY_NODE_MODULE_RETURN_VALUE(result);
 }
 
@@ -626,7 +666,7 @@ MY_NODE_MODULE_CALLBACK(PrintDirect)
 {
     MY_NODE_MODULE_HANDLESCOPE;
     //TODO: to move in an unique place win and posix input parameters processing
-    REQUIRE_ARGUMENTS(iArgs, 4);
+    REQUIRE_ARGUMENTS(iArgs, 5);
 
     // can be string or buffer
     if(iArgs.Length()<=0)
@@ -636,20 +676,9 @@ MY_NODE_MODULE_CALLBACK(PrintDirect)
 
     std::string data;
     v8::Handle<v8::Value> arg0(iArgs[0]);
-
-    if(arg0->IsString())
+    if (!getStringOrBufferFromV8Value(arg0, data))
     {
-        v8::String::Utf8Value data_str_v8(arg0->ToString());
-        data.assign(*data_str_v8, data_str_v8.length());
-    }
-    else if(arg0->IsObject() && arg0.As<v8::Object>()->HasIndexedPropertiesInExternalArrayData())
-    {
-        data.assign(static_cast<char*>(arg0.As<v8::Object>()->GetIndexedPropertiesExternalArrayData()),
-                    arg0.As<v8::Object>()->GetIndexedPropertiesExternalArrayDataLength());
-    }
-    else
-    {
-        RETURN_EXCEPTION_STR("Argument 0 must be a string or NativeBuffer");
+        RETURN_EXCEPTION_STR("Argument 0 must be a string or Buffer");
     }
 
     REQUIRE_ARGUMENT_STRINGW(iArgs, 1, printername);
@@ -666,7 +695,7 @@ MY_NODE_MODULE_CALLBACK(PrintDirect)
     if (!printerHandle)
     {
         std::string error_str("error on PrinterHandle: ");
-	error_str += getLastErrorCodeAndMessage();
+        error_str += getLastErrorCodeAndMessage();
         RETURN_EXCEPTION_STR(error_str.c_str());
     }
 
@@ -702,4 +731,10 @@ MY_NODE_MODULE_CALLBACK(PrintDirect)
         RETURN_EXCEPTION_STR("not sent all bytes");
     }
     MY_NODE_MODULE_RETURN_VALUE(V8_VALUE_NEW(Number, dwJob));
+}
+
+MY_NODE_MODULE_CALLBACK(PrintFile)
+{
+    MY_NODE_MODULE_HANDLESCOPE;
+    RETURN_EXCEPTION_STR("Not yet implemented on Windows");
 }

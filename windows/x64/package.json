@@ -1,7 +1,7 @@
 {
   "name": "printer",
   "description": "Node.js printer bindings",
-  "version": "0.1.1",
+  "version": "0.2.1",
   "homepage": "http://github.com/tojocky/node-printer",
   "author": {
     "name": "Ion Lupascu",
@@ -27,7 +27,6 @@
     "node": ">= 0.8.0"
   },
   "scripts": {
-    "test": "nodeunit -I lib test/*.test.js"
   },
   "licenses": [
     {
